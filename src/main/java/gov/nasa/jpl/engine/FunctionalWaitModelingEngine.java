@@ -14,11 +14,17 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
- * Implementation of ModelingEngine that uses ArrayBlockingQueue objects for
+ * Implementation of ModelingEngine that uses blocking queues for
  * synchronization between threads. Schedules Waiter objects to run at a given
  * time. Waiter objects basically contain information to run a function at a
  * given time. These are used to schedule Activity modeling, resuming threads,
  * or Activity functions which need to be run upon a signal or time.
+ *
+ * Thread-resume handoff uses {@link SynchronousQueue}: the resume waiter
+ * blocks in {@code put} until the waiting activity thread is in {@code take}.
+ * The modeling worker therefore does not retire until the handoff has
+ * actually completed. A failed handoff throws, so the engine reports Error
+ * instead of silently dropping the only runnable turn.
  */
 public class FunctionalWaitModelingEngine extends ModelingEngine implements WaitProvider {
 
@@ -88,7 +94,7 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
             thrownException = ex;
         }
         finally {
-            threadPool.shutdown();
+            threadPool.shutdownNow();
             inmodel = false;
         }
     }
@@ -110,9 +116,8 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
 
                     Waiter future = next.execute();
                     if (next.resumedAThread()) {
-                        // If the waiter we just executed resumed
-                        // another worker thread, then we need to
-                        // end processing immediately.
+                        // execute() used SynchronousQueue.put, so the waiting
+                        // thread has already taken the token and owns the turn.
                         return;
                     }
 
@@ -167,23 +172,34 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
     }
 
     /**
+     * Hands a token to a parked activity thread. Blocks until that thread is
+     * in {@code take()}, so retirement cannot precede the handoff.
+     */
+    private static void transferTurn(BlockingQueue<?> queue, Object token) {
+        try {
+            @SuppressWarnings("unchecked")
+            BlockingQueue<Object> q = (BlockingQueue<Object>) queue;
+            q.put(token);
+        }
+        catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while handing off modeling turn", ex);
+        }
+    }
+
+    /**
      * Schedules a Waiter to resume this thread at time t.
      * @param t the time to resume execution.
      */
     @Override
     public void waitUntil(Time t) {
         try {
-            BlockingQueue<Object> queue = new ArrayBlockingQueue<>(1);
-            // queue a waiter to resume this thread at a future time
+            // Rendezvous: put() waits for take(). A buffered ArrayBlockingQueue
+            // would let the resume worker retire before this thread parks.
+            final BlockingQueue<Object> queue = new SynchronousQueue<Object>();
             Waiter waiter = new Waiter(t, 0, () -> {
-                try {
-                    // we can put() any non-null object
-                    queue.put(this);
-                    return null;
-                }
-                catch (InterruptedException ex) {
-                    return null;
-                }
+                transferTurn(queue, FunctionalWaitModelingEngine.this);
+                return null;
             });
             waiter.willResumeThread(true);
             insertWaiter(waiter);
@@ -206,16 +222,11 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
      */
     @Override
     public Map waitForSignal(String signalName) throws InterruptedException {
-        BlockingQueue<Map> queue = new ArrayBlockingQueue<>(1);
-        // give the signal a handler to queue up when the signal is raised
+        final BlockingQueue<Map> queue = new SynchronousQueue<Map>();
         Signal.getSignal(signalName).addSignalHandler(true, (m) -> {
-            try {
-                // we can't put() a null object
-                queue.put(m == null ? new HashMap() : m);
-                return null;
-            } catch (InterruptedException ex) {
-                return null;
-        }});
+            transferTurn(queue, m == null ? new HashMap() : m);
+            return null;
+        });
         // tell the main thread that this thread is going into wait state
         workerToMain.put(Result.Waiting);
         // now we wait until the signal is raised and the data map is
