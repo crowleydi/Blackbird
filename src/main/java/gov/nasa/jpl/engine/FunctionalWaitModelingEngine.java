@@ -10,27 +10,37 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.logging.Logger;
 
 /**
  * Implementation of ModelingEngine that uses ArrayBlockingQueue objects for
- * synchronization between threads. Schedules Waiter objects to run at a given
- * time. Waiter objects basically contain information to run a function at a
- * given time. These are used to schedule Activity modeling, resuming threads,
- * or Activity functions which need to be run upon a signal or time.
+ * synchronization between threads, with an explicit drain-turn lock so two
+ * workers cannot mutate the waiter queue at once.
+ *
+ * Small-patch hardening of the existing worker design:
+ * - ReentrantLock owns the drain loop (one turn)
+ * - waiters queue is synchronized
+ * - resume put failure is an Error, not a silent retire
+ * - daemon activity workers and shutdownNow() so a dropped turn cannot freeze the JVM
  */
 public class FunctionalWaitModelingEngine extends ModelingEngine implements WaitProvider {
 
-    // Result signals sent from worker thread to the main modeling thread
+    private static final Logger LOGGER = Logger.getLogger(FunctionalWaitModelingEngine.class.getName());
+
     private enum Result {
-        Waiting, // signal to the engine that worker thread is going into a wait state
-        Error,   // signal to the engine that an error has occurred and modeling needs to stop
-        Done     // signal to the engine the modelling has completed successfully
+        Waiting,
+        Error,
+        Done
     }
 
     private final PriorityQueue<Waiter> waiters = new PriorityQueue<>();
-    private final BlockingQueue<Result> workerToMain = new ArrayBlockingQueue<>(1);
+    private final Object waitersLock = new Object();
+    private final ReentrantLock turn = new ReentrantLock();
+    private final BlockingQueue<Result> workerToMain = new ArrayBlockingQueue<>(8);
     private Exception thrownException = null;
     private boolean inmodel = false;
 
@@ -38,47 +48,46 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
     {
     }
 
-    /**
-     * Method which runs the modeling. All Activity objects are scheduled to run.
-     */
     @Override
     protected void runModeling() {
-        waiters.clear();
+        synchronized (waitersLock) {
+            waiters.clear();
+        }
         ActivityInstanceList activities = ActivityInstanceList.getActivityList();
         for (int i = 0; i < activities.length(); i++) {
             insertActivityIntoEngine(activities.get(i));
         }
 
-        // Initial time is set to the first activity (waiter) in queue
-        Time currentModelingTime = waiters.isEmpty() ? null : waiters.peek().getTime();
+        Time currentModelingTime;
+        synchronized (waitersLock) {
+            currentModelingTime = waiters.isEmpty() ? null : waiters.peek().getTime();
+        }
         if (currentModelingTime == null) {
             currentModelingTime = new Time();
         }
 
-        // This call clears and then sets initial profile for all resources
         initTime(currentModelingTime);
-
         thrownException = null;
 
-        ExecutorService threadPool = Executors.newCachedThreadPool();
+        final AtomicInteger n = new AtomicInteger();
+        ExecutorService threadPool = Executors.newCachedThreadPool(new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "blackbird-worker-" + n.incrementAndGet());
+                t.setDaemon(true);
+                return t;
+            }
+        });
         try {
             inmodel = true;
             threadPool.submit(this::runModelingThread);
 
-            Result res = Result.Error; // anything but Done so we can enter the loop below
+            Result res = Result.Error;
             while (res != Result.Done) {
-
-                // wait until we get a result from the worker thread
                 res = workerToMain.take();
-
-                // the worker thread caught a thrown error, so we need to re-throw
-                // from this main thread
                 if (res == Result.Error) {
                     throw new RuntimeException(thrownException);
                 }
-
-                // the worker thread is going into wait state, so we need to start
-                // another worker thread
                 if (res == Result.Waiting) {
                     threadPool.submit(this::runModelingThread);
                 }
@@ -88,34 +97,34 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
             thrownException = ex;
         }
         finally {
-            threadPool.shutdown();
+            threadPool.shutdownNow();
             inmodel = false;
+            if (turn.isHeldByCurrentThread()) {
+                turn.unlock();
+            }
         }
     }
 
-    /**
-     * Function run by each worker thread. The worker thread continues to run until one of the following things happen:
-     * 1) Modeling is done
-     * 2) An Error happens.
-     * 3) It enters a wait state by the adaptation calling one of the explicit wait functions.
-     * (waitUntil, waitFor, waitForSignal)
-     * 4) Or until it resumes another worker thread that was in a wait state.
-     */
     private void runModelingThread() {
+        if (!turn.tryLock()) {
+            LOGGER.fine("worker skipped drain; another thread already holds the modeling turn");
+            return;
+        }
         try {
             try {
-                while (!waiters.isEmpty()) {
-                    Waiter next = waiters.remove();
+                while (true) {
+                    Waiter next;
+                    synchronized (waitersLock) {
+                        if (waiters.isEmpty()) {
+                            break;
+                        }
+                        next = waiters.remove();
+                    }
                     setTime(next.getTime());
-
                     Waiter future = next.execute();
                     if (next.resumedAThread()) {
-                        // If the waiter we just executed resumed
-                        // another worker thread, then we need to
-                        // end processing immediately.
                         return;
                     }
-
                     if (future != null) {
                         insertWaiter(future);
                     }
@@ -128,14 +137,15 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
             }
         }
         catch (InterruptedException ex) {
-            // we got interrupted. ignore and exit
+            // interrupted during shutdown
+        }
+        finally {
+            if (turn.isHeldByCurrentThread()) {
+                turn.unlock();
+            }
         }
     }
 
-    /**
-     * Inserts a Waiter into the modeling queue.
-     * @param toInsert the Waiter to be inserted.
-     */
     @Override
     void insertWaiter(Waiter toInsert) {
         if (inmodel && toInsert.getTime().lessThan(getCurrentTime())) {
@@ -143,18 +153,14 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
                     "Current time is [%s]. Cannot schedule an event at [%s] because it is in the past.",
                     getCurrentTime().toString(), toInsert.getTime().toString()));
         }
-        waiters.add(toInsert);
+        synchronized (waitersLock) {
+            waiters.add(toInsert);
+        }
     }
 
-    /**
-     * Inserts an Activity into the modeling queue.
-     * @param activity the activity to be inserted.
-     */
     @Override
     public void insertActivityIntoEngine(Activity activity) {
-        // set the WaitProvider for the Activity
         activity.setThread(this);
-        // queue a waiter to run at Activity start time
         insertWaiter(new Waiter(activity.getStart(), 1, () -> {
             ActivityTypeList.getActivityList().propertyChangeForActivityType(activity.getType(), activity);
             try {
@@ -166,68 +172,56 @@ public class FunctionalWaitModelingEngine extends ModelingEngine implements Wait
         }));
     }
 
-    /**
-     * Schedules a Waiter to resume this thread at time t.
-     * @param t the time to resume execution.
-     */
+    private static void deliver(BlockingQueue<Object> queue, Object token) {
+        try {
+            queue.put(token);
+        }
+        catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while handing off modeling turn", ex);
+        }
+    }
+
     @Override
     public void waitUntil(Time t) {
         try {
-            BlockingQueue<Object> queue = new ArrayBlockingQueue<>(1);
-            // queue a waiter to resume this thread at a future time
+            final BlockingQueue<Object> queue = new ArrayBlockingQueue<Object>(1);
             Waiter waiter = new Waiter(t, 0, () -> {
-                try {
-                    // we can put() any non-null object
-                    queue.put(this);
-                    return null;
-                }
-                catch (InterruptedException ex) {
-                    return null;
-                }
+                deliver(queue, FunctionalWaitModelingEngine.this);
+                return null;
             });
             waiter.willResumeThread(true);
             insertWaiter(waiter);
-            // tell the main thread that this thread is going into wait state
+            if (turn.isHeldByCurrentThread()) {
+                turn.unlock();
+            }
             workerToMain.put(Result.Waiting);
-            // wait on the queue until an object is put into it
-            // this is how the thread waits
             queue.take();
+            turn.lock();
         }
         catch (InterruptedException ex) {
             throw new RuntimeException(ex);
         }
     }
 
-    /**
-     * Schedules a waiter to resume this thread upon the given signal
-     * @param signalName name of signal to wait
-     * @return data sent when the signal was raised
-     * @throws InterruptedException
-     */
     @Override
     public Map waitForSignal(String signalName) throws InterruptedException {
-        BlockingQueue<Map> queue = new ArrayBlockingQueue<>(1);
-        // give the signal a handler to queue up when the signal is raised
+        final BlockingQueue<Object> queue = new ArrayBlockingQueue<Object>(1);
         Signal.getSignal(signalName).addSignalHandler(true, (m) -> {
-            try {
-                // we can't put() a null object
-                queue.put(m == null ? new HashMap() : m);
-                return null;
-            } catch (InterruptedException ex) {
-                return null;
-        }});
-        // tell the main thread that this thread is going into wait state
+            deliver(queue, m == null ? new HashMap() : m);
+            return null;
+        });
+        if (turn.isHeldByCurrentThread()) {
+            turn.unlock();
+        }
         workerToMain.put(Result.Waiting);
-        // now we wait until the signal is raised and the data map is
-        // put into the queue
-        return queue.take();
+        Object payload = queue.take();
+        turn.lock();
+        @SuppressWarnings("unchecked")
+        Map result = (Map) payload;
+        return result;
     }
-    /**
-     * Returns a Waiter object that can be returned to the modeling engine to execute at a time in the future.
-     * @param t time in future to execute the given function
-     * @param func the given function
-     * @return Waiter object
-     */
+
     @Override
     public Waiter waitUntil(Time t, Supplier<Waiter> func) {
         return new Waiter(t, 0, func);
